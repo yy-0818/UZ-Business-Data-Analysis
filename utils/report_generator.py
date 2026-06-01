@@ -3,6 +3,7 @@
 
 import io
 import os
+import re
 from datetime import datetime
 from typing import Optional
 import pandas as pd
@@ -36,42 +37,68 @@ MID_GRAY    = colors.HexColor("#7F8C8D")
 WHITE       = colors.white
 
 
-def _p(cell_idx: int) -> str:
-    """Alignment for cell index: first col = left, rest = right."""
-    return "RIGHT" if cell_idx > 0 else "LEFT"
+_CONTENT_WIDTH = A4[0] - 3.6 * cm  # matches build_pdf left/right margins
+
+
+def _commentary_paragraphs(commentary: str) -> list[str]:
+    return [p.strip() for p in commentary.split("\n\n") if p.strip()]
+
+
+def _md_bold_to_html(text: str) -> str:
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+
+def _col_widths(num_cols: int) -> list:
+    """Distribute table columns across the printable page width."""
+    if num_cols <= 1:
+        return [_CONTENT_WIDTH]
+    first = min(_CONTENT_WIDTH * 0.26, 4.2 * cm)
+    rest = (_CONTENT_WIDTH - first) / (num_cols - 1)
+    return [first] + [rest] * (num_cols - 1)
+
+
+def _cell_paragraph(text, *, bold=False, align=TA_LEFT, size=8.5, color=None, nowrap=False):
+    """Build a table cell paragraph; nowrap keeps currency values on one line."""
+    body = str(text) if text is not None else ""
+    if nowrap and body:
+        body = f"<nobr>{body}</nobr>"
+    return Paragraph(
+        f"<b>{body}</b>" if bold else body,
+        ParagraphStyle(
+            "cell", fontName=_BOLD_FONT if bold else _CJK_FONT,
+            fontSize=size, alignment=align,
+            textColor=color or colors.HexColor("#2C3E50"),
+        ),
+    )
 
 
 def _money_table(data: list, cols: list, title: str) -> Table:
     """Build a styled money table with proper Chinese font."""
     header = [
-        Paragraph(f"<b>{c}</b>", ParagraphStyle(
-            "th", fontName=_BOLD_FONT, fontSize=9,
-            textColor=WHITE))
+        _cell_paragraph(c, bold=True, align=TA_CENTER, size=9, color=WHITE, nowrap=True)
         for c in cols
     ]
     rows = [header]
     for row in data:
-        cells = [
-            Paragraph(str(c) if c is not None else "", ParagraphStyle(
-                "td", fontName=_CJK_FONT, fontSize=8.5))
-            for c in row
-        ]
+        cells = []
+        for ci, c in enumerate(row):
+            align = TA_LEFT if ci == 0 else TA_RIGHT
+            cells.append(_cell_paragraph(c, align=align, nowrap=(ci > 0)))
         rows.append(cells)
 
-    col_count = len(cols)
-    col_widths = [3.5*cm] + [2.0*cm] * (col_count - 1)
-
+    col_widths = _col_widths(len(cols))
     t = Table(rows, colWidths=col_widths, repeatRows=1)
     t.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0), (-1,  0),  MID_BLUE),
         ("TEXTCOLOR",    (0, 0), (-1,  0),  WHITE),
         ("ROWBACKGROUNDS",(0, 1), (-1, -1),  [WHITE, LIGHT_GRAY]),
-        ("ALIGN",        (0, 0), (-1, -1),  "LEFT"),
+        ("ALIGN",        (0, 0), (0,  -1),  "LEFT"),
         ("ALIGN",        (1, 0), (-1, -1),  "RIGHT"),
+        ("VALIGN",       (0, 0), (-1, -1),  "MIDDLE"),
         ("FONTNAME",     (0, 0), (-1,  0),  _BOLD_FONT),
         ("FONTSIZE",     (0, 0), (-1, -1),  8.5),
-        ("TOPPADDING",   (0, 0), (-1, -1),  5),
-        ("BOTTOMPADDING",(0, 0), (-1, -1),  5),
+        ("TOPPADDING",   (0, 0), (-1, -1),  6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1),  6),
         ("LEFTPADDING",  (0, 0), (-1, -1),  8),
         ("RIGHTPADDING", (0, 0), (-1, -1),  8),
         ("GRID",         (0, 0), (-1, -1),  0.5, colors.HexColor("#BDC3C7")),
@@ -79,31 +106,44 @@ def _money_table(data: list, cols: list, title: str) -> Table:
     return t
 
 
+def _kpi_card(label, value, sub, card_width) -> Table:
+    """Single KPI card as a nested mini-table."""
+    inner_rows = [
+        [_cell_paragraph(value, bold=True, align=TA_CENTER, size=13, color=MID_BLUE, nowrap=True)],
+        [_cell_paragraph(label, align=TA_CENTER, size=10, color=MID_GRAY)],
+    ]
+    if sub:
+        sub_color = ACCENT_GREEN if str(sub).startswith("+") else ACCENT_RED
+        inner_rows.append([_cell_paragraph(sub, align=TA_CENTER, size=8, color=sub_color)])
+    card = Table(inner_rows, colWidths=[card_width - 8])
+    card.setStyle(TableStyle([
+        ("ALIGN",        (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",   (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return card
+
+
 def _kpi_table(kpis: list) -> Table:
-    """Build KPI summary cards as a table."""
-    cells = []
-    for label, value, sub in kpis:
-        inner = [
-            Paragraph(str(value), ParagraphStyle(
-                "kv", fontName=_BOLD_FONT, fontSize=16,
-                textColor=MID_BLUE, alignment=TA_CENTER)),
-            Paragraph(str(label), ParagraphStyle(
-                "kl", fontName=_CJK_FONT, fontSize=9,
-                textColor=MID_GRAY, alignment=TA_CENTER)),
-        ]
-        if sub:
-            inner.append(Paragraph(str(sub), ParagraphStyle(
-                "ks", fontName=_CJK_FONT, fontSize=8,
-                textColor=ACCENT_GREEN if str(sub).startswith("+") else ACCENT_RED,
-                alignment=TA_CENTER)))
-        cells.append(inner)
-    n = min(len(cells), 4)
-    t = Table([cells[:n]], colWidths=[5.5*cm]*n)
+    """Build KPI summary cards as a table (wraps to two rows when >4 items)."""
+    per_row = 4 if len(kpis) > 4 else len(kpis)
+    col_w = _CONTENT_WIDTH / per_row
+    cards = [_kpi_card(label, value, sub, col_w) for label, value, sub in kpis]
+
+    if len(cards) <= per_row:
+        rows = [cards]
+    else:
+        rows = [cards[:per_row], cards[per_row:] + [""] * (per_row - len(cards[per_row:]))]
+
+    t = Table(rows, colWidths=[col_w] * per_row)
     t.setStyle(TableStyle([
         ("ALIGN",        (0, 0), (-1, -1), "CENTER"),
         ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",   (0, 0), (-1, -1), 12),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 12),
+        ("TOPPADDING",   (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 10),
         ("BACKGROUND",   (0, 0), (-1, -1), LIGHT_BLUE),
         ("BOX",          (0, 0), (-1, -1), 1, MID_BLUE),
         ("INNERGRID",    (0, 0), (-1, -1), 0.5, colors.HexColor("#BDC3C7")),
@@ -157,7 +197,7 @@ def build_pdf(
         textColor=MID_GRAY, alignment=TA_CENTER))
     styles.add(ParagraphStyle("Period",
         fontName=_CJK_FONT, fontSize=10,
-        textColor=MID_GRAY))
+        textColor=MID_GRAY, spaceAfter=8))
 
     story = []
 
@@ -165,7 +205,11 @@ def build_pdf(
     story.append(Paragraph(title, styles["ReportTitle"]))
     if period:
         story.append(Paragraph(period, styles["Period"]))
-    story.append(HRFlowable(width="100%", thickness=2, color=ACCENT_GOLD, spaceAfter=10))
+    story.append(Spacer(1, 2))
+    story.append(HRFlowable(
+        width="100%", thickness=2, color=ACCENT_GOLD,
+        spaceBefore=0, spaceAfter=12,
+    ))
 
     # ── KPIs ───────────────────────────────────────────────────────────────
     story.append(Paragraph("核心指标", styles["SectionHeader"]))
@@ -176,7 +220,11 @@ def build_pdf(
     # ── Commentary ──────────────────────────────────────────────────────────
     if commentary:
         story.append(Paragraph("分析批语", styles["SectionHeader"]))
-        story.append(Paragraph(commentary, styles["Commentary"]))
+        paras = _commentary_paragraphs(commentary)
+        for i, para in enumerate(paras):
+            story.append(Paragraph(_md_bold_to_html(para), styles["Commentary"]))
+            if i < len(paras) - 1:
+                story.append(Spacer(1, 4))
         story.append(Spacer(1, 6))
 
     # ── Tables ─────────────────────────────────────────────────────────────
@@ -224,8 +272,9 @@ def build_markdown(
             lines.append(f"| {label} | **{value}** | {sub or '—'} |")
 
     if commentary:
-        lines.append(f"\n## 分析批语\n")
-        lines.append(f"> {commentary}\n")
+        lines.append("\n## 分析批语\n")
+        for para in _commentary_paragraphs(commentary):
+            lines.append(f"> {para}\n>\n")
 
     for table_title, table_data, table_cols in tables:
         lines.append(f"\n## {table_title}\n")
@@ -247,6 +296,11 @@ def build_html(
     period: str = "",
 ) -> str:
     """Build a self-contained HTML report."""
+    commentary_html = "".join(
+        f"<p>{_md_bold_to_html(p)}</p>"
+        for p in _commentary_paragraphs(commentary)
+    ) if commentary else ""
+
     kpi_rows = ""
     for label, value, sub in kpis:
         color = ACCENT_GREEN if str(sub).startswith("+") else (ACCENT_RED if str(sub).startswith("-") else MID_BLUE)
@@ -298,7 +352,7 @@ def build_html(
   .kpi-grid {{ display: flex; flex-wrap: wrap; gap: 12px; padding: 20px 28px;
                background: #D6E8F7; }}
   .kpi-card {{ flex: 1; min-width: 140px; background: white; border-radius: 6px;
-               padding: 16px 12px; text-align: center; border: 1px solid #BDC3C7; }}
+               padding: 8px 6px; text-align: center; border: 1px solid #BDC3C7; }}
   .kpi-value {{ font-size: 20px; font-weight: 700; margin-bottom: 4px; word-break: break-all; }}
   .kpi-label {{ font-size: 11px; color: #7F8C8D; margin-bottom: 4px; }}
   .kpi-sub {{ font-size: 11px; color: #27AE60; min-height: 14px; }}
@@ -309,6 +363,8 @@ def build_html(
                  border-left: 4px solid #2E6DA4; border-radius: 4px;
                  font-size: 14px; line-height: 1.8; color: #34495E; }}
   .commentary h2 {{ font-size: 14px; color: #1B3A5C; margin-bottom: 10px; }}
+  .commentary p {{ margin-bottom: 12px; }}
+  .commentary p:last-child {{ margin-bottom: 0; }}
   .section {{ padding: 20px 28px; border-top: 1px solid #ECF0F1; }}
   .section h2 {{ font-size: 14px; color: #1B3A5C; margin-bottom: 12px; }}
   .table-wrap {{ overflow-x: auto; }}
@@ -341,7 +397,7 @@ def build_html(
 
   <div class="commentary">
     <h2>分析批语</h2>
-    {commentary}
+    {commentary_html}
   </div>
 
   {table_rows}

@@ -13,7 +13,6 @@ from utils.narrative_generator import (
     generate_sales_commentary,
     generate_product_commentary,
 )
-from utils.exchange_rate import get_usd_to_uzs_rate, som_to_usd
 
 
 def _raw_col(df):
@@ -26,10 +25,6 @@ def _fmt_usd(v):
 
 def _fmt_som(v):
     return f"₴{v:,.2f}"
-
-
-def _fmt_rate(v):
-    return f"{v:.2f}%"
 
 
 def _make_kpis(df, col_df):
@@ -46,17 +41,8 @@ def _make_kpis(df, col_df):
     if not col_df.empty:
         col_usd = col_df["美金_clean"].sum()
         col_som = col_df["苏姆_clean"].sum()
-        try:
-            rate = get_usd_to_uzs_rate()
-            col_som_usd = som_to_usd(col_som, rate)
-            col_total_usd = col_usd + col_som_usd
-        except Exception:
-            col_total_usd = col_usd
-        kpis.append(("收款美金合计", _fmt_usd(col_total_usd), ""))
+        kpis.append(("收款美金合计", _fmt_usd(col_usd), ""))
         kpis.append(("收款苏姆合计", _fmt_som(col_som), ""))
-        if total_usd > 0:
-            collection_rate = (col_total_usd / total_usd) * 100
-            kpis.append(("回款率", _fmt_rate(collection_rate), ""))
     return kpis
 
 
@@ -182,105 +168,29 @@ def _collection_tables(col_df):
                   ["账户", "收款美金 ($)", "收款苏姆 (₴)", "笔数"]))
 
     total_col_usd = col_df["美金_clean"].sum()
+    total_col_som = col_df["苏姆_clean"].sum()
     cust = (
         col_df.groupby(rc)
         .agg(收款美金=("美金_clean", "sum"), 收款苏姆=("苏姆_clean", "sum"),
              笔数=("日期_clean", "count"))
         .reset_index()
-        .sort_values("收款美金", ascending=False)
     )
-    cust["占比"] = (cust["收款美金"] / total_col_usd * 100).round(2)
+    cust["美金占比"] = (
+        (cust["收款美金"] / total_col_usd * 100).round(2) if total_col_usd > 0 else 0
+    )
+    cust["苏姆占比"] = (
+        (cust["收款苏姆"] / total_col_som * 100).round(2) if total_col_som > 0 else 0
+    )
+    cust = cust.sort_values(
+        ["收款美金", "收款苏姆"], ascending=[False, False],
+    )
     tables.append(("客户收款排名",
                   [[r[rc], _fmt_usd(r["收款美金"]), _fmt_som(r["收款苏姆"]),
-                    int(r["笔数"]), f"{r['占比']:.2f}%"]
+                    int(r["笔数"]), f"{r['美金占比']:.2f}%", f"{r['苏姆占比']:.2f}%"]
                    for _, r in cust.iterrows()],
-                  ["客户名称", "收款美金 ($)", "收款苏姆 (₴)", "笔数", "占比 (%)"]))
+                  ["客户名称", "收款美金 ($)", "收款苏姆 (₴)", "笔数",
+                   "美金占比 (%)", "苏姆占比 (%)"]))
     return tables
-
-
-def _sales_collection_table(df, col_df):
-    """Build a combined sales vs collection table with collection rate."""
-    if df.empty:
-        return None
-
-    total_sales_usd = df["合计$_clean"].sum()
-
-    if not col_df.empty:
-        col_usd = col_df["美金_clean"].sum()
-        col_som = col_df["苏姆_clean"].sum()
-        try:
-            rate = get_usd_to_uzs_rate()
-            col_som_usd = som_to_usd(col_som, rate)
-            col_total_usd = col_usd + col_som_usd
-        except Exception:
-            col_total_usd = col_usd
-    else:
-        col_total_usd = 0.0
-
-    collection_rate = (col_total_usd / total_sales_usd * 100) if total_sales_usd > 0 else 0
-
-    rows = []
-    raw_col = _raw_col(df)
-    sales_by_cust = (
-        df.groupby(raw_col)
-        .agg(销售美金=("合计$_clean", "sum"))
-        .reset_index()
-        .sort_values("销售美金", ascending=False)
-    )
-
-    if not col_df.empty:
-        rc = _raw_col(col_df)
-        col_by_cust = (
-            col_df.groupby(rc)
-            .agg(收款美金=("美金_clean", "sum"), 收款苏姆=("苏姆_clean", "sum"))
-            .reset_index()
-        )
-        combined = sales_by_cust.merge(
-            col_by_cust, left_on=raw_col, right_on=rc, how="left"
-        ).fillna(0)
-        if rc != raw_col and f"{rc}_x" in combined.columns:
-            combined = combined.drop(columns=[f"{rc}_x"])
-
-        for _, r in combined.iterrows():
-            c_usd = r["收款美金"]
-            c_som = r["收款苏姆"]
-            try:
-                rate = get_usd_to_uzs_rate()
-                c_som_usd = som_to_usd(c_som, rate)
-                c_total_usd = c_usd + c_som_usd
-            except Exception:
-                c_total_usd = c_usd
-            s_usd = r["销售美金"]
-            c_rate = (c_total_usd / s_usd * 100) if s_usd > 0 else 0
-            rows.append([
-                r[raw_col],
-                _fmt_usd(s_usd),
-                _fmt_usd(c_total_usd),
-                f"{c_rate:.2f}%",
-            ])
-
-        # Sort by sales USD descending
-        rows.sort(key=lambda x: float(x[1].replace("$", "").replace(",", "")), reverse=True)
-        cols = ["客户名称", "销售美金 ($)", "收款美金 ($)", "回款率"]
-    else:
-        for _, r in sales_by_cust.iterrows():
-            rows.append([
-                r[raw_col],
-                _fmt_usd(r["销售美金"]),
-                _fmt_usd(0.0),
-                "0.00%",
-            ])
-        cols = ["客户名称", "销售美金 ($)", "收款美金 ($)", "回款率"]
-
-    # Summary row
-    rows.append([
-        "合计",
-        _fmt_usd(total_sales_usd),
-        _fmt_usd(col_total_usd),
-        f"{collection_rate:.2f}%",
-    ])
-
-    return ("销售收款汇总", rows, cols)
 
 
 def render():
@@ -330,34 +240,22 @@ def render():
         raw_col = _raw_col(df)
         total_customers = df[raw_col].nunique()
 
-        col_count = 4 if col_df.empty else 5
-        cols = st.columns(col_count)
-        with cols[0]:
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        with kc1:
             st.metric("销售美金", f"${total_usd:,.2f}")
-        with cols[1]:
+        with kc2:
             st.metric("销售单数", f"{total_orders:,}")
-        with cols[2]:
+        with kc3:
             st.metric("客户数量", f"{total_customers}")
-        if not col_df.empty:
-            col_som = col_df["苏姆_clean"].sum()
-            col_usd = col_df["美金_clean"].sum()
-            try:
-                rate = get_usd_to_uzs_rate()
-                col_som_usd = som_to_usd(col_som, rate)
-                col_total_usd = col_usd + col_som_usd
-            except Exception:
-                col_total_usd = col_usd
-            with cols[3]:
-                st.metric("收款美金", f"${col_total_usd:,.2f}")
-            with cols[4]:
-                collection_rate = (col_total_usd / total_usd * 100) if total_usd > 0 else 0
-                st.metric("回款率", f"{collection_rate:.2f}%")
-        else:
-            with cols[3]:
-                st.metric("收款美金", "无数据")
+        with kc4:
+            if not col_df.empty:
+                col_som = col_df["苏姆_clean"].sum()
+                st.metric("收款苏姆", f"₴{col_som:,.2f}")
+            else:
+                st.metric("收款苏姆", "无数据")
 
         # ── Commentary preview ─────────────────────────────────────────────
-        commentary = generate_sales_commentary(df, period_label=period)
+        commentary = generate_sales_commentary(df, period_label=period, col_df=col_df)
         with st.expander("📝 分析批语预览", expanded=True):
             st.markdown(commentary)
 
@@ -380,10 +278,6 @@ def render():
         if generate:
             kpis = _make_kpis(df, col_df)
             tables = _sales_tables(df, is_single_month=is_single_month)
-            # Add combined sales vs collection table
-            sc_table = _sales_collection_table(df, col_df)
-            if sc_table:
-                tables.append(sc_table)
             tables += _collection_tables(col_df)
 
             footer = "销售分析系统"

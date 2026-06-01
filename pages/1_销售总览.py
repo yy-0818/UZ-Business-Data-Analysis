@@ -7,7 +7,7 @@ from streamlit_echarts import st_pyecharts
 from pyecharts import options as opts
 from pyecharts.charts import Line, Bar, Pie, Grid, HeatMap
 from pyecharts.components import Table
-from utils.helpers import check_data_loaded, get_filtered_sales
+from utils.helpers import check_data_loaded, get_filtered_sales, get_filtered_collection
 from utils.narrative_generator import generate_sales_commentary
 
 
@@ -243,13 +243,11 @@ def render():
         return
 
     period = "当前筛选周期"
-    commentary = generate_sales_commentary(df, period_label=period)
+    col_df = get_filtered_collection()
+    commentary = generate_sales_commentary(df, period_label=period, col_df=col_df)
 
     with st.expander("📝 AI 分析批语", expanded=True):
-        st.markdown(f"<div style='padding:12px 16px; background:#F5F7FA;"
-                    f" border-left:4px solid #2E6DA4; border-radius:4px;"
-                    f" font-size:14px; line-height:1.7; color:#34495E;'>{commentary}</div>",
-                    unsafe_allow_html=True)
+        st.markdown(commentary)
 
     tab1, tab2, tab3 = st.tabs(
         ["📊 趋势分析", "🏷️ 分类分析", "🏆 TOP排名"]
