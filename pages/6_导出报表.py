@@ -7,201 +7,48 @@ from datetime import datetime
 from utils.helpers import (
     check_data_loaded, get_filtered_sales, get_filtered_collection,
     period_label as _period_label, apply_quick_filter,
+    apply_previous_period_filter, comparison_period_label,
 )
 from utils.report_generator import build_pdf, build_markdown, build_html
-from utils.narrative_generator import (
-    generate_sales_commentary,
-    generate_product_commentary,
+from utils.report_aggregates import (
+    raw_col, make_kpis, sales_tables, collection_tables,
 )
+from utils.report_cache import cached_sales_commentary
 
 
-def _raw_col(df):
-    return "客户名称" if "客户名称" in df.columns else "客户名称_clean"
+def _resolve_periods(quick: str):
+    """Apply quick filter and comparison period on sidebar-filtered data."""
+    base_df = get_filtered_sales()
+    base_col = get_filtered_collection()
 
+    if quick == "全部":
+        df = base_df
+        col_df = base_col
+        df_prev = apply_previous_period_filter(base_df, "全部", date_col="日期")
+        col_prev = apply_previous_period_filter(base_col, "全部", date_col="日期_clean")
+        period = _period_label()
+    else:
+        df = apply_quick_filter(base_df, quick, date_col="日期")
+        col_df = apply_quick_filter(base_col, quick, date_col="日期_clean")
+        df_prev = apply_previous_period_filter(base_df, quick, date_col="日期")
+        col_prev = apply_previous_period_filter(base_col, quick, date_col="日期_clean")
+        period = quick
 
-def _fmt_usd(v):
-    return f"${v:,.2f}"
-
-
-def _fmt_som(v):
-    return f"₴{v:,.2f}"
-
-
-def _make_kpis(df, col_df):
-    """Build KPI list for the report."""
-    total_usd = df["合计$_clean"].sum()
-    total_orders = df["单据编号"].nunique()
-    raw_col = _raw_col(df)
-    total_customers = df[raw_col].nunique()
-    kpis = [
-        ("销售美金合计", _fmt_usd(total_usd), ""),
-        ("销售单数", f"{total_orders:,}", ""),
-        ("客户数量", f"{total_customers}", ""),
-    ]
-    if not col_df.empty:
-        col_usd = col_df["美金_clean"].sum()
-        col_som = col_df["苏姆_clean"].sum()
-        kpis.append(("收款美金合计", _fmt_usd(col_usd), ""))
-        kpis.append(("收款苏姆合计", _fmt_som(col_som), ""))
-    return kpis
-
-
-def _sales_tables(df, is_single_month=False):
-    """Build table list for sales section."""
-    tables = []
-    raw_col = _raw_col(df)
-
-    # Monthly (only if not single month)
-    if not is_single_month:
-        m = (
-            df.groupby(["年份", "月份"])
-            .agg(销售美金=("合计$_clean", "sum"), 销售苏姆=("苏姆合计_clean", "sum"),
-                 单数=("单据编号", "nunique"))
-            .reset_index()
-        )
-        m["年月"] = (m["年份"].astype(str) + "-" +
-                     m["月份"].astype(str).str.zfill(2))
-        m = m.sort_values(["年份", "月份"])
-        tables.append(("月度销售汇总",
-                      [[r["年月"], int(r["单数"]), _fmt_usd(r["销售美金"]), _fmt_som(r["销售苏姆"])]
-                       for _, r in m.iterrows()],
-                      ["年月", "单数", "销售美金 ($)", "销售苏姆 (₴)"]))
-
-    # By account
-    total_acc_usd = df["合计$_clean"].sum()
-    acc = (
-        df.groupby("账户")
-        .agg(销售美金=("合计$_clean", "sum"), 销售苏姆=("苏姆合计_clean", "sum"),
-             单数=("单据编号", "nunique"))
-        .reset_index()
-        .sort_values("销售美金", ascending=False)
+    has_comparison = (
+        df_prev is not None and not df_prev.empty
+    ) or (
+        col_prev is not None and not col_prev.empty
     )
-    acc["占比"] = (acc["销售美金"] / total_acc_usd * 100).round(2)
-    tables.append(("按账户汇总",
-                  [[r["账户"], _fmt_usd(r["销售美金"]), _fmt_som(r["销售苏姆"]),
-                    int(r["单数"]), f"{r['占比']:.2f}%"]
-                   for _, r in acc.iterrows()],
-                  ["账户", "销售美金 ($)", "销售苏姆 (₴)", "单数", "占比 (%)"]))
-
-    # By category
-    if "类别" in df.columns:
-        cat_total_usd = df["合计$_clean"].sum()
-        cat = (
-            df.groupby("类别")
-            .agg(销售美金=("合计$_clean", "sum"), 箱数=("箱数_clean", "sum"))
-            .reset_index()
-            .sort_values("销售美金", ascending=False)
-        )
-        cat["占比"] = (cat["销售美金"] / cat_total_usd * 100).round(2)
-        tables.append(("按产品类别汇总",
-                      [[r["类别"], _fmt_usd(r["销售美金"]), int(r["箱数"]), f"{r['占比']:.2f}%"]
-                       for _, r in cat.iterrows()],
-                      ["类别", "销售美金 ($)", "销售箱数", "占比 (%)"]))
-
-    # 客户类别总览
-    if "客户类别" in df.columns:
-        cat_total_usd = df["合计$_clean"].sum()
-        bc = (
-            df.groupby("客户类别")
-            .agg(销售美金=("合计$_clean", "sum"), 销售苏姆=("苏姆合计_clean", "sum"),
-                 销售单数=("单据编号", "nunique"), 销售数量=("单据编号", "count"))
-            .reset_index()
-            .sort_values("销售美金", ascending=False)
-        )
-        bc["占比"] = (bc["销售美金"] / cat_total_usd * 100).round(2)
-        tables.append(("客户类别总览",
-                      [[r["客户类别"], _fmt_usd(r["销售美金"]),
-                        _fmt_som(r["销售苏姆"]), int(r["销售单数"]),
-                        int(r["销售数量"]), f"{r['占比']:.2f}%"]
-                       for _, r in bc.iterrows()],
-                      ["客户类别", "销售美金 ($)", "销售苏姆 (₴)", "销售单数", "销售数量", "占比 (%)"]))
-
-    # All customers
-    total_usd = df["合计$_clean"].sum()
-    cust = (
-        df.groupby(raw_col)
-        .agg(销售美金=("合计$_clean", "sum"), 单数=("单据编号", "nunique"))
-        .reset_index()
-        .sort_values("销售美金", ascending=False)
-    )
-    cust["占比"] = (cust["销售美金"] / total_usd * 100).round(2)
-    tables.append(("客户销售排名",
-                  [[r[raw_col], _fmt_usd(r["销售美金"]), f"{r['占比']:.2f}%", int(r["单数"])]
-                   for _, r in cust.iterrows()],
-                  ["客户名称", "销售美金 ($)", "占比 (%)", "单数"]))
-
-    # Top products
-    prod_total_usd = df["合计$_clean"].sum()
-    prod = (
-        df.groupby("商品名称_clean")
-        .agg(销售美金=("合计$_clean", "sum"), 箱数=("箱数_clean", "sum"))
-        .reset_index()
-        .sort_values("销售美金", ascending=False)
-        .head(10)
-    )
-    prod["占比"] = (prod["销售美金"] / prod_total_usd * 100).round(2)
-    tables.append(("产品销售排名 TOP10",
-                  [[r["商品名称_clean"], _fmt_usd(r["销售美金"]),
-                    int(r["箱数"]), f"{r['占比']:.2f}%"]
-                   for _, r in prod.iterrows()],
-                  ["产品名称", "销售美金 ($)", "箱数", "占比 (%)"]))
-
-    return tables
-
-
-def _collection_tables(col_df):
-    tables = []
-    if col_df.empty:
-        return tables
-    rc = _raw_col(col_df)
-
-    acc = (
-        col_df.groupby("账户")
-        .agg(收款美金=("美金_clean", "sum"), 收款苏姆=("苏姆_clean", "sum"),
-             笔数=("日期_clean", "count"))
-        .reset_index()
-        .sort_values("收款美金", ascending=False)
-    )
-    tables.append(("按账户收款汇总",
-                  [[r["账户"], _fmt_usd(r["收款美金"]), _fmt_som(r["收款苏姆"]), int(r["笔数"])]
-                   for _, r in acc.iterrows()],
-                  ["账户", "收款美金 ($)", "收款苏姆 (₴)", "笔数"]))
-
-    total_col_usd = col_df["美金_clean"].sum()
-    total_col_som = col_df["苏姆_clean"].sum()
-    cust = (
-        col_df.groupby(rc)
-        .agg(收款美金=("美金_clean", "sum"), 收款苏姆=("苏姆_clean", "sum"),
-             笔数=("日期_clean", "count"))
-        .reset_index()
-    )
-    cust["美金占比"] = (
-        (cust["收款美金"] / total_col_usd * 100).round(2) if total_col_usd > 0 else 0
-    )
-    cust["苏姆占比"] = (
-        (cust["收款苏姆"] / total_col_som * 100).round(2) if total_col_som > 0 else 0
-    )
-    cust = cust.sort_values(
-        ["收款美金", "收款苏姆"], ascending=[False, False],
-    )
-    tables.append(("客户收款排名",
-                  [[r[rc], _fmt_usd(r["收款美金"]), _fmt_som(r["收款苏姆"]),
-                    int(r["笔数"]), f"{r['美金占比']:.2f}%", f"{r['苏姆占比']:.2f}%"]
-                   for _, r in cust.iterrows()],
-                  ["客户名称", "收款美金 ($)", "收款苏姆 (₴)", "笔数",
-                   "美金占比 (%)", "苏姆占比 (%)"]))
-    return tables
+    return df, col_df, df_prev, col_prev, period, has_comparison
 
 
 def render():
     check_data_loaded()
     st.title("📥 导出报表")
 
-    df = get_filtered_sales()
-    col_df = get_filtered_collection()
-    period = _period_label()
+    period_sidebar = _period_label()
 
-    if df.empty:
+    if get_filtered_sales().empty:
         st.warning("当前筛选条件下无销售数据")
         return
 
@@ -215,14 +62,12 @@ def render():
             index=0,
             label_visibility="collapsed",
         )
-    if quick != "全部":
-        df = apply_quick_filter(df, quick)
-        col_df = apply_quick_filter(col_df, quick)
-        if df.empty:
-            st.warning(f"「{quick}」区间内无销售数据")
-            return
 
-    period = quick if quick != "全部" else _period_label()
+    df, col_df, df_prev, col_prev, period, has_comparison = _resolve_periods(quick)
+
+    if df.empty:
+        st.warning(f"「{quick}」区间内无销售数据" if quick != "全部" else "当前筛选条件下无销售数据")
+        return
 
     tab1, tab2, tab3 = st.tabs(["📊 综合分析报告", "📋 明细查询", "🔍 客户对账单"])
 
@@ -234,28 +79,26 @@ def render():
         生成可直接向客户展示的专业商业报告。
         """)
 
-        # ── KPI preview ──────────────────────────────────────────────────
-        total_usd = df["合计$_clean"].sum()
-        total_orders = df["单据编号"].nunique()
-        raw_col = _raw_col(df)
-        total_customers = df[raw_col].nunique()
+        if has_comparison:
+            st.caption(f"对比基准：{comparison_period_label(quick)}")
 
-        kc1, kc2, kc3, kc4 = st.columns(4)
-        with kc1:
-            st.metric("销售美金", f"${total_usd:,.2f}")
-        with kc2:
-            st.metric("销售单数", f"{total_orders:,}")
-        with kc3:
-            st.metric("客户数量", f"{total_customers}")
-        with kc4:
-            if not col_df.empty:
-                col_som = col_df["苏姆_clean"].sum()
-                st.metric("收款苏姆", f"₴{col_som:,.2f}")
-            else:
-                st.metric("收款苏姆", "无数据")
+        # ── KPI preview (aligned with report KPIs) ─────────────────────────
+        kpis_preview = make_kpis(df, col_df, df_prev, col_prev)
 
-        # ── Commentary preview ─────────────────────────────────────────────
-        commentary = generate_sales_commentary(df, period_label=period, col_df=col_df)
+        ncol = min(len(kpis_preview), 4)
+        cols = st.columns(ncol)
+        for i, (label, value, delta) in enumerate(kpis_preview[:ncol]):
+            with cols[i]:
+                st.metric(label, value, delta if delta else None)
+
+        if len(kpis_preview) > ncol:
+            cols2 = st.columns(len(kpis_preview) - ncol)
+            for j, (label, value, delta) in enumerate(kpis_preview[ncol:]):
+                with cols2[j]:
+                    st.metric(label, value, delta if delta else None)
+
+        # ── Commentary preview (cached) ────────────────────────────────────
+        commentary = cached_sales_commentary(df, col_df, df_prev, period)
         with st.expander("📝 分析批语预览", expanded=True):
             st.markdown(commentary)
 
@@ -271,14 +114,17 @@ def render():
         with col_gen:
             generate = st.button("🚀 生成报告", type="primary", use_container_width=True)
 
-        # Determine if single month
-        unique_months = df.groupby(["年份", "月份"]).ngroups if "年份" in df.columns and "月份" in df.columns else 1
+        unique_months = (
+            df.groupby(["年份", "月份"]).ngroups
+            if "年份" in df.columns and "月份" in df.columns
+            else 1
+        )
         is_single_month = unique_months == 1
 
         if generate:
-            kpis = _make_kpis(df, col_df)
-            tables = _sales_tables(df, is_single_month=is_single_month)
-            tables += _collection_tables(col_df)
+            kpis = make_kpis(df, col_df, df_prev, col_prev)
+            tables = sales_tables(df, is_single_month=is_single_month)
+            tables += collection_tables(col_df)
 
             footer = "销售分析系统"
             filename_prefix = f"销售分析报告_{datetime.now().strftime('%Y%m%d_%H%M')}"
@@ -292,7 +138,7 @@ def render():
                             commentary=commentary,
                             tables=tables,
                             footer_note=footer,
-                            period=period,
+                            period=period if quick != "全部" else period_sidebar,
                         )
                         st.success("HTML 报告生成成功！")
                         st.download_button(
@@ -311,7 +157,7 @@ def render():
                             commentary=commentary,
                             tables=tables,
                             footer_note=footer,
-                            period=period,
+                            period=period if quick != "全部" else period_sidebar,
                         )
                         st.success("Markdown 报告生成成功！")
                         st.download_button(
@@ -322,14 +168,14 @@ def render():
                             use_container_width=True,
                         )
 
-                    else:  # PDF
+                    else:
                         content = build_pdf(
                             title="销售分析报告",
                             kpis=kpis,
                             commentary=commentary,
                             tables=tables,
                             footer_note=footer,
-                            period=period,
+                            period=period if quick != "全部" else period_sidebar,
                         )
                         st.success("PDF 报告生成成功！")
                         st.download_button(
@@ -383,10 +229,10 @@ def render():
         st.subheader("销售/收款明细查询")
 
         search = st.text_input("搜索客户名称或单据编号", key="export_search")
-        raw_col = _raw_col(df)
+        rc = raw_col(df)
         if search:
             results = df[
-                df[raw_col].str.contains(search, case=False, na=False) |
+                df[rc].str.contains(search, case=False, na=False) |
                 df["单据编号"].str.contains(search, case=False, na=False)
             ]
             st.markdown(f"找到 **{len(results)}** 条销售记录")
@@ -394,7 +240,7 @@ def render():
                 results.assign(
                     日期=lambda x: x["日期"].dt.strftime("%Y-%m-%d"),
                     合计=lambda x: x["合计$_clean"].apply(lambda v: f"${v:,.2f}"),
-                )[["日期", "单据编号", raw_col, "商品名称_clean",
+                )[["日期", "单据编号", rc, "商品名称_clean",
                    "合计", "箱数_clean", "账户"]]
                 .rename(columns={"箱数_clean": "箱数"})
                 .head(200),
@@ -402,7 +248,7 @@ def render():
             )
 
             if not col_df.empty:
-                col_raw = _raw_col(col_df)
+                col_raw = raw_col(col_df)
                 cres = col_df[
                     col_df[col_raw].str.contains(search, case=False, na=False)
                 ]
@@ -420,24 +266,23 @@ def render():
 
     with tab3:
         st.subheader("客户销售汇总")
-        raw_col = _raw_col(df)
+        rc = raw_col(df)
         sa = (
-            df.groupby([raw_col, "账户"])
+            df.groupby([rc, "账户"])
             .agg(销售美金=("合计$_clean", "sum"), 销售苏姆=("苏姆合计_clean", "sum"),
                  销售单数=("单据编号", "nunique"))
             .reset_index()
         )
         if not col_df.empty:
-            col_raw = _raw_col(col_df)
+            col_raw = raw_col(col_df)
             ca = (
                 col_df.groupby([col_raw, "账户"])
                 .agg(收款美金=("美金_clean", "sum"), 收款苏姆=("苏姆_clean", "sum"))
                 .reset_index()
             )
-            rec = sa.merge(ca, left_on=[raw_col, "账户"], right_on=[col_raw, "账户"],
+            rec = sa.merge(ca, left_on=[rc, "账户"], right_on=[col_raw, "账户"],
                           how="left").fillna(0)
-            # When both sides have same column name, pandas suffixes with _x/_y
-            dup = (col_raw if col_raw != raw_col else raw_col) + "_x"
+            dup = (col_raw if col_raw != rc else rc) + "_x"
             if dup in rec.columns:
                 rec = rec.drop(columns=[dup])
         else:
@@ -445,11 +290,11 @@ def render():
             rec["收款美金"] = 0.0
             rec["收款苏姆"] = 0.0
 
-        customers = [""] + sorted(rec[raw_col].unique().tolist())
+        customers = [""] + sorted(rec[rc].unique().tolist())
         sel = st.selectbox("选择客户", customers, key="export_cust_stmt")
 
         if sel:
-            cr = rec[rec[raw_col] == sel]
+            cr = rec[rec[rc] == sel]
             st.dataframe(
                 cr.assign(
                     销售美金=lambda x: x["销售美金"].apply(lambda v: f"${v:,.2f}"),
