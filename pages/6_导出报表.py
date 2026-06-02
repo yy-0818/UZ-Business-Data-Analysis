@@ -16,6 +16,30 @@ from utils.report_aggregates import (
 from utils.report_cache import cached_sales_commentary
 
 
+def _quick_option_label(base_df: pd.DataFrame, option: str) -> str:
+    """Display quick option with concrete date span."""
+    if option == "全部":
+        return option
+    if base_df.empty or "日期" not in base_df.columns:
+        return option
+    scoped = apply_quick_filter(base_df, option, date_col="日期")
+    if scoped.empty:
+        return option
+    dates = pd.to_datetime(scoped["日期"], errors="coerce").dropna()
+    if dates.empty:
+        return option
+    start = dates.min().strftime("%Y.%m.%d")
+    end = dates.max().strftime("%Y.%m.%d")
+    return f"{option}（{start}-{end}）"
+
+
+def _report_period_label(base_df: pd.DataFrame, quick: str, period_sidebar: str) -> str:
+    """Period text rendered in exported reports and commentary."""
+    if quick == "全部":
+        return period_sidebar
+    return _quick_option_label(base_df, quick)
+
+
 def _resolve_periods(quick: str):
     """Apply quick filter and comparison period on sidebar-filtered data."""
     base_df = get_filtered_sales()
@@ -55,15 +79,18 @@ def render():
     # ── Quick date range selector ──────────────────────────────────────────
     st.caption("快速选择报告周期（覆盖侧边栏筛选）")
     qc1, qc2 = st.columns([1, 3])
+    base_sales_for_label = get_filtered_sales()
     with qc1:
         quick = st.selectbox(
             "报告周期",
             options=["全部", "本月", "上月", "近三月", "本年"],
             index=0,
+            format_func=lambda opt: _quick_option_label(base_sales_for_label, opt),
             label_visibility="collapsed",
         )
 
     df, col_df, df_prev, col_prev, period, has_comparison = _resolve_periods(quick)
+    report_period = _report_period_label(base_sales_for_label, quick, period_sidebar)
 
     if df.empty:
         st.warning(f"「{quick}」区间内无销售数据" if quick != "全部" else "当前筛选条件下无销售数据")
@@ -98,7 +125,7 @@ def render():
                     st.metric(label, value, delta if delta else None)
 
         # ── Commentary preview (cached) ────────────────────────────────────
-        commentary = cached_sales_commentary(df, col_df, df_prev, period)
+        commentary = cached_sales_commentary(df, col_df, df_prev, report_period)
         with st.expander("📝 分析批语预览", expanded=True):
             st.markdown(commentary)
 
@@ -138,7 +165,7 @@ def render():
                             commentary=commentary,
                             tables=tables,
                             footer_note=footer,
-                            period=period if quick != "全部" else period_sidebar,
+                            period=report_period,
                         )
                         st.success("HTML 报告生成成功！")
                         st.download_button(
@@ -157,7 +184,7 @@ def render():
                             commentary=commentary,
                             tables=tables,
                             footer_note=footer,
-                            period=period if quick != "全部" else period_sidebar,
+                            period=report_period,
                         )
                         st.success("Markdown 报告生成成功！")
                         st.download_button(
@@ -175,7 +202,7 @@ def render():
                             commentary=commentary,
                             tables=tables,
                             footer_note=footer,
-                            period=period if quick != "全部" else period_sidebar,
+                            period=report_period,
                         )
                         st.success("PDF 报告生成成功！")
                         st.download_button(
